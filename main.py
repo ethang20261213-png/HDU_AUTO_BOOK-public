@@ -26,6 +26,34 @@ WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'
 BOOK_DAYS_AHEAD = 2  # 预约后天
 ALREADY_BOOKED_KEYS = ("已有预约", "重复预约", "请先取消", "当前已有", "只能预约一个", "已存在预约")
 SEAT_TAKEN_KEYS = ("已被", "占用", "不可用", "不存在", "冲突")
+SUCCESS_KEYS = ("成功",)
+RELEASE_HOUR = 20  # 后天的号源在当天 20:00 开放
+
+
+def seconds_until_release():
+    """距离今天 20:00 放号还有多少秒；已过放号时间返回 0。"""
+    now = datetime.now()
+    release = now.replace(hour=RELEASE_HOUR, minute=0, second=0, microsecond=0)
+    return max(0.0, (release - now).total_seconds())
+
+
+def in_snipe_window():
+    """放号前 5 分钟到放号后 30 秒之间，视为守点窗口。"""
+    if 0 < seconds_until_release() <= 300:
+        return True
+    now = datetime.now()
+    release = now.replace(hour=RELEASE_HOUR, minute=0, second=0, microsecond=0)
+    return 0 <= (now - release).total_seconds() <= 30
+
+
+def wait_until_release(max_wait=300):
+    """守点：距今晚 20:00 放号不足 max_wait 秒时，等到放号整点再继续下单。"""
+    until = seconds_until_release()
+    if 0 < until <= max_wait:
+        print("守点模式：{:.1f} 秒后（20:00）放号，等待中……".format(until))
+        time.sleep(until)
+        return True
+    return False
 
 
 def target_weekday_name():
@@ -128,10 +156,13 @@ class SeatAutoBooker:
 
     def _book_slot(self, user_config, seat_config, start, hours, preferred_seat=None):
         retry_sleep_time = timedelta(minutes=self.cfg["cron-delta-minutes"]).seconds*2/(self.cfg["max-retry"]-2) - 10
+        seat_idx = 0  # 候选座位下标：只有座位被占时才往后挪一位，保证按名单顺序尝试
         for tried_times in range(self.cfg["max-retry"]):
             try:
-                result = self._book_favorite_seat(user_config, seat_config, start, hours, tried_times, preferred_seat)
+                result = self._book_favorite_seat(user_config, seat_config, start, hours, seat_idx, preferred_seat)
                 msg = str(result[1]) if result else ""
+                if result and any(k in msg for k in SUCCESS_KEYS):
+                    return result
                 if result and any(k in msg for k in ALREADY_BOOKED_KEYS):
                     print("该时段已有预约，跳过：{}".format(result[1]))
                     return result
@@ -141,14 +172,20 @@ class SeatAutoBooker:
                     continue
                 if result and any(k in msg for k in SEAT_TAKEN_KEYS):
                     print("座位不可约({})，换一个再试".format(result[1]))
+                    seat_idx += 1
+                    continue
+                if result is not None and in_snipe_window():
+                    # 守点窗口内的其他回复多半是"尚未开放"（服务器钟点可能差几秒）：短暂重试，不换座
+                    print("守点重试（{}）".format(result[1]))
+                    time.sleep(0.5)
                     continue
                 return result
             except Exception as e:
                 logging.exception(e)
                 print(e.__class__, "尝试第{}次".format(tried_times))
-                time.sleep(retry_sleep_time)
+                time.sleep(0.5 if in_snipe_window() else retry_sleep_time)
 
-    def _book_favorite_seat(self, user_config, seat_config, start, hours, tried_times=0, preferred_seat=None):
+    def _book_favorite_seat(self, user_config, seat_config, start, hours, seat_idx=0, preferred_seat=None):
         logging.info('Entering _book_favorite_seat method')
         date_config = user_config[target_weekday_name()]
         seats = get_seats_with_config(user_config, date_config, seat_config)
@@ -156,11 +193,11 @@ class SeatAutoBooker:
         book_time = today_0_clock + timedelta(days=BOOK_DAYS_AHEAD) + timedelta(hours=start)
         delta = book_time - self.cfg["start-time"]
         total_seconds = delta.days * 24 * 3600 + delta.seconds
-        # 第一轮优先沿用上一时段约到的座位，被占后再随机换
-        if tried_times == 0 and preferred_seat in seats:
+        # 自定义名单按顺序逐个尝试（seat_idx 是第几个候选）；多时段时第一轮优先沿用上一时段约到的座位；区域模式保持随机
+        if seat_idx == 0 and preferred_seat in seats:
             seat = preferred_seat
-        elif date_config['name'] == '自定义' and tried_times<self.cfg["max-retry"]/3*2:
-            seat = seats[0]
+        elif date_config['name'] == '自定义':
+            seat = seats[min(seat_idx, len(seats) - 1)]
         else:
             seat = random.choice(seats)
         data = f"beginTime={total_seconds}&duration={3600 * hours}&&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
@@ -168,6 +205,7 @@ class SeatAutoBooker:
         headers = self.cfg["headers"]
         headers['Cookie'] = self.cookie
         print(data)
+        print("下单请求发出：{}".format(datetime.now().strftime("%H:%M:%S.%f")[:-3]))
         self.resp = requests.post(self.cfg["target"], data=data, headers=headers)
         self.json = json.loads(self.resp.text)
         return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
@@ -292,6 +330,7 @@ if __name__ == "__main__":
         s.driver.quit()
         logging.info('Getting user info unsuccessful')
         exit(-1)
+    wait_until_release()
     results = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
     for slot, code, message in results:
         print("预约结果[{}]: {} {}".format(slot, code, message))
