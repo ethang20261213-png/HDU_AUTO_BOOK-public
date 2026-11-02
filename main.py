@@ -233,7 +233,7 @@ class SeatAutoBooker:
             resp = session.post("https://sso.hdu.edu.cn/v1/tickets",
                                 data={"username": self.un, "password": self.pd}, timeout=15)
             if resp.status_code != 201:
-                print("接口登录失败：申请 TGT 返回 {}".format(resp.status_code))
+                print("接口登录失败：申请 TGT 返回 {}：{}".format(resp.status_code, (resp.text or "")[:300]))
                 return False
             tgt = resp.headers.get("Location", "").rstrip("/").rsplit("/", 1)[-1]
             if not tgt.startswith("TGT"):
@@ -246,7 +246,7 @@ class SeatAutoBooker:
             resp = session.post("https://sso.hdu.edu.cn/v1/tickets/" + tgt,
                                 data={"service": service}, timeout=15)
             if resp.status_code != 200 or "ST-" not in resp.text:
-                print("接口登录失败：申请 ST 返回 {}".format(resp.status_code))
+                print("接口登录失败：申请 ST 返回 {}：{}".format(resp.status_code, (resp.text or "")[:300]))
                 return False
             st = resp.text.strip()
             session.get(service + "&ticket=" + st, timeout=15)
