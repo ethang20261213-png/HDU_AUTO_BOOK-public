@@ -230,6 +230,11 @@ class SeatAutoBooker:
         全程几次 HTTP 请求，约 1-3 秒。成功返回 True 并设置 self.cookie / self.user_data。"""
         try:
             session = requests.Session()
+            # 必须用浏览器 UA：学校 WAF 会直接拦截 python-requests 的默认 UA（返回 403 网页）
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/json,*/*",
+            })
             resp = session.post("https://sso.hdu.edu.cn/v1/tickets",
                                 data={"username": self.un, "password": self.pd}, timeout=15)
             if resp.status_code != 201:
