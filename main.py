@@ -1,6 +1,7 @@
 import requests
 import yaml
 import random
+import re
 from datetime import datetime, timedelta
 import json
 import os
@@ -23,7 +24,7 @@ logging.basicConfig(
                     level=logging.INFO)
 
 WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
-BOOK_DAYS_AHEAD = 2  # 预约后天
+BOOK_DAYS_AHEAD = int(os.environ.get("BOOK_DAYS_AHEAD", "2"))  # 预约后天；环境变量可覆盖（测试用）
 ALREADY_BOOKED_KEYS = ("已有预约", "重复预约", "请先取消", "当前已有", "只能预约一个", "已存在预约")
 SEAT_TAKEN_KEYS = ("已被", "占用", "不可用", "不存在", "冲突")
 SUCCESS_KEYS = ("成功",)
@@ -122,6 +123,15 @@ class SeatAutoBooker:
         except KeyError:
             print("没有Server酱的key,将不会推送消息")
 
+        self.driver = None  # 浏览器只在回退登录时才启动（懒加载，接口登录不需要）
+        self.wait = None
+        self.cookie = None
+
+        self.cfg = booker_config
+
+    def _ensure_driver(self):
+        if self.driver is not None:
+            return
         chrome_options = Options()
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
@@ -135,9 +145,14 @@ class SeatAutoBooker:
         service = Service(chromedriver_path) if chromedriver_path else Service()
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.wait = WebDriverWait(self.driver, 10, 0.5)
-        self.cookie = None
 
-        self.cfg = booker_config
+    def quit_driver(self):
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
 
     def book_favorite_seat(self, user_config, seat_config):
         results = []
@@ -210,10 +225,68 @@ class SeatAutoBooker:
         self.json = json.loads(self.resp.text)
         return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
 
+    def _login_http(self):
+        """纯接口登录：走学校 CAS 的 REST 接口（/v1/tickets）拿 TGT→ST，再回图书馆换 session cookie。
+        全程几次 HTTP 请求，约 1-3 秒。成功返回 True 并设置 self.cookie / self.user_data。"""
+        try:
+            session = requests.Session()
+            resp = session.post("https://sso.hdu.edu.cn/v1/tickets",
+                                data={"username": self.un, "password": self.pd}, timeout=15)
+            if resp.status_code != 201:
+                print("接口登录失败：申请 TGT 返回 {}".format(resp.status_code))
+                return False
+            tgt = resp.headers.get("Location", "").rstrip("/").rsplit("/", 1)[-1]
+            if not tgt.startswith("TGT"):
+                m = re.search(r"TGT-[A-Za-z0-9\-]+", resp.text or "")
+                tgt = m.group(0) if m else ""
+            if not tgt:
+                print("接口登录失败：未拿到 TGT")
+                return False
+            service = "https://hdu.huitu.zhishulib.com/User/Index/hduCASLogin?forward=%2FSeat%2FIndex%2FsearchSeats"
+            resp = session.post("https://sso.hdu.edu.cn/v1/tickets/" + tgt,
+                                data={"service": service}, timeout=15)
+            if resp.status_code != 200 or "ST-" not in resp.text:
+                print("接口登录失败：申请 ST 返回 {}".format(resp.status_code))
+                return False
+            st = resp.text.strip()
+            session.get(service + "&ticket=" + st, timeout=15)
+            pairs = {}
+            for c in session.cookies:
+                if "zhishulib.com" in (c.domain or ""):
+                    pairs[c.name] = c.value
+            if not pairs:
+                print("接口登录失败：未拿到图书馆 cookie")
+                return False
+            self.cookie = ";".join("{}={}".format(k, v) for k, v in pairs.items())
+            self.cfg["headers"]['Cookie'] = self.cookie
+            # 验证会话真的可用（能拿到 uid 才算登录成功）
+            resp = session.get("https://hdu.huitu.zhishulib.com/Seat/Index/searchSeats?LAB_JSON=1",
+                               timeout=15)
+            data = (resp.json() or {}).get("DATA") or {}
+            if not data.get("uid"):
+                print("接口登录失败：图书馆未返回用户数据")
+                return False
+            self.user_data = data
+            logging.info("接口登录成功！")
+            return True
+        except Exception as e:
+            logging.exception(e)
+            print("接口登录异常：{}".format(e.__class__.__name__))
+            return False
+
     def login(self):
         logging.info('Login in')
+        if os.environ.get("HTTP_LOGIN", "1") != "0":
+            if self._login_http():
+                return 0
+            print("接口登录失败，回退浏览器登录")
+        return self._login_selenium()
+
+    def _login_selenium(self):
+        logging.info('Login in (browser)')
 
         try:
+            self._ensure_driver()
             logging.info('开始登陆...')
 
             self.driver.get("https://hdu.huitu.zhishulib.com/")
@@ -267,6 +340,10 @@ class SeatAutoBooker:
     def get_user_info(self):
         logging.info('Getting user info')
 
+        if self.user_data and self.user_data.get('uid'):
+            print("获取用户数据成功")
+            return 0
+
         headers = self.cfg["headers"]
         headers['Cookie'] = self.cookie
         try:
@@ -303,7 +380,7 @@ class SeatAutoBooker:
 
 if __name__ == "__main__":
     logging.info('Start of the program')
-    with open("user_config.yml", 'r') as f_obj:
+    with open(os.environ.get("USER_CONFIG", "user_config.yml"), 'r') as f_obj:
         user_config = yaml.safe_load(f_obj)
     with open("config/basic_config.yml", 'r') as f_obj:
         basic_config = yaml.safe_load(f_obj)
@@ -323,16 +400,16 @@ if __name__ == "__main__":
 
     s = SeatAutoBooker(basic_config["SeatAutoBooker"])
     if not s.login() == 0:
-        s.driver.quit()
+        s.quit_driver()
         logging.info('Login unsuccessful')
         exit(-1)
     if not s.get_user_info() == 0:
-        s.driver.quit()
+        s.quit_driver()
         logging.info('Getting user info unsuccessful')
         exit(-1)
     wait_until_release()
     results = s.book_favorite_seat(user_config=user_config, seat_config=seat_config)
     for slot, code, message in results:
         print("预约结果[{}]: {} {}".format(slot, code, message))
-    s.driver.quit()
+    s.quit_driver()
     logging.info('End of the program')
